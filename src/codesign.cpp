@@ -62,13 +62,14 @@ const char *entitlements = NULL;	// path to entitlement configuration input
 const char *resourceRules = NULL;	// explicit resource rules template
 const char *uniqueIdentifier = NULL; // unique ident hash
 const char *identifierPrefix = NULL; // prefix for un-dotted default identifiers
+const char *teamID = NULL;          // TeamID
 const char *modifiedFiles = NULL;	// file to receive list of modified files
 const char *extractCerts = NULL;	// location for extracting signing chain certificates
 const char *sdkRoot = NULL;			// alternate root for looking up sub-components
 const char *featureCheck = NULL;	// feature support check
-SecCSFlags staticVerifyOptions = kSecCSCheckAllArchitectures; // option flags to static verifications
-SecCSFlags dynamicVerifyOptions = kSecCSDefaultFlags; // option flags to static verifications
-SecCSFlags signOptions = kSecCSDefaultFlags; // option flags to signing operations
+SecCSFlags staticVerifyOptions = kSecCSCheckAllArchitectures | kSecCSStrictValidate; // option flags to static verifications
+SecCSFlags dynamicVerifyOptions = kSecCSDefaultFlags; // option flags to dynamic verifications
+SecCSFlags signOptions = kSecCSSignStrictPreflight; // option flags to signing operations
 uint32_t digestAlgorithm = 0;		// digest algorithm to be used when signing
 CFDateRef signingTime;				// explicit signing time option
 size_t signatureSize = 0;			// override CMS blob estimate
@@ -84,6 +85,7 @@ uint32_t preserveMetadata = 0;		// what metadata to keep from previous signature
 CFBooleanRef timestampRequest = NULL; // timestamp service request
 bool noTSAcerts = false;			// Don't request certificates with ts request
 const char *tsaURL = NULL;			// TimeStamping Authority URL
+const char *dumpBinary = NULL;		// dump a binary image of the CodeDirectory to disk
 
 
 //
@@ -107,6 +109,9 @@ static OSStatus keychain_open(const char *name, SecKeychainRef &keychain);
 static void chooseArchitecture(const char *arg);
 static uint32_t parseMetadataFlags(const char *arg);
 static void checkFeatures(const char *arg);
+static bool checkTeamId(const char *teamID);
+
+static const int TEAM_ID_MAX = 100;
 
 
 //
@@ -118,6 +123,7 @@ enum {
 	optBundleVersion,
 	optCheckExpiration,
 	optCheckRevocation,
+	optCodeDirectory,
 	optContinue,
 	optDeep,
 	optDetachedDatabase,
@@ -144,7 +150,10 @@ enum {
 	optSigningTime,
 	optSignatureSize,
     optTimestamp,
-    optTSANoCerts
+    optTSANoCerts,
+    optTeamID,
+    optNoStrict,
+    optSealRoot,
 };
 
 const struct option options[] = {
@@ -168,6 +177,7 @@ const struct option options[] = {
 	{ "bundle-version", required_argument,	NULL, optBundleVersion },
 	{ "check-expiration", no_argument,		NULL, optCheckExpiration },
 	{ "check-revocation", no_argument,		NULL, optCheckRevocation },
+	{ "codedirectory", required_argument,		NULL, optCodeDirectory },
 	{ "continue",	no_argument,			NULL, optContinue },
 	{ "deep",		no_argument,			NULL, optDeep },
 	{ "deep-verify", no_argument,			NULL, optDeep },	// legacy
@@ -186,6 +196,7 @@ const struct option options[] = {
 	{ "no-legacy-signing", no_argument,		NULL, optNoLegacy },
 	{ "no-macho",	no_argument,			NULL, optNoMachO },
 	{ "numeric-errors", no_argument,		NULL, optNumeric },
+	{ "team-identifier", required_argument,		NULL, optTeamID },
 	{ "prefix",		required_argument,		NULL, optIdentifierPrefix },
 	{ "preserve-metadata", optional_argument, NULL, optPreserveMetadata },
 	{ "procaction",	required_argument,		NULL, optProcAction },
@@ -198,6 +209,8 @@ const struct option options[] = {
 	{ "signing-time", required_argument,	NULL, optSigningTime },
 	{ "timestamp",	optional_argument,		NULL, optTimestamp },
 	{ "no-tsa-certs",	no_argument,		NULL, optTSANoCerts },
+	{ "no-strict",	no_argument,			NULL, optNoStrict },
+	{ "seal-root",	no_argument,			NULL, optSealRoot },
 	{ }
 };
 
@@ -300,6 +313,9 @@ int main(int argc, char *argv[])
 			case optDryRun:
 				dryrun = true;
 				break;
+			case optCodeDirectory:
+				dumpBinary = optarg;
+				break;
 			case optEntitlements:
 				entitlements = optarg;
 				break;
@@ -321,6 +337,12 @@ int main(int argc, char *argv[])
 			case optFileList:
 				modifiedFiles = optarg;
 				break;
+			case optTeamID:
+				if (checkTeamId(optarg))
+					teamID = optarg;
+				else
+					fail("TeamIdentifier must be at least 1 and no more than %d alphanumeric characters", TEAM_ID_MAX);
+				break;
 			case optIdentifierPrefix:
 				identifierPrefix = optarg;
 				break;
@@ -337,7 +359,7 @@ int main(int argc, char *argv[])
 				signOptions |= kSecCSSignOpaque;	// no need for V2 signature for FMJ
 				break;
 			case optNoLegacy:
-				signOptions = kSecCSSignNoV1;
+				signOptions |= kSecCSSignNoV1;
 				break;
 			case optNoMachO:
 				noMachO = true;
@@ -372,6 +394,7 @@ int main(int argc, char *argv[])
 				break;
 			case optResourceRules:
 				resourceRules = optarg;
+				note(0, "Warning: --resource-rules has been deprecated in Mac OS X >= 10.10!");
 				break;
 			case optSDKRoot:
 				sdkRoot = optarg;
@@ -381,6 +404,13 @@ int main(int argc, char *argv[])
 				break;
 			case optSigningTime:
 				signingTime = parseDate(optarg);
+				break;
+			case optNoStrict:
+				signOptions &= ~kSecCSSignStrictPreflight;
+				staticVerifyOptions &= ~kSecCSStrictValidate;
+				break;
+			case optSealRoot:
+				signOptions |= kSecCSSignBundleRoot;
 				break;
 				
 			case '?':
@@ -511,6 +541,21 @@ keychain_open(const char *name, SecKeychainRef &keychain)
 	return SecKeychainOpen(name, &keychain);
 }
 
+static bool checkTeamId(const char *teamID)
+{
+	if (!teamID)
+		return false;
+	
+	size_t id_len = strnlen(teamID, TEAM_ID_MAX+1);
+	if (id_len > TEAM_ID_MAX || id_len < 1)
+		return false;
+	
+	for (size_t i = 0; i < id_len; i++) {
+		if (!isalnum(teamID[i]))
+			return false;
+	}
+	return true;
+}
 
 void chooseArchitecture(const char *arg)
 {
@@ -538,16 +583,24 @@ static uint32_t parseMetadataFlags(const char *arg)
 		{ "entitlements", kSecCodeSignerPreserveEntitlements,	true },
 		{ "resource-rules", kSecCodeSignerPreserveResourceRules,true },
 		{ "flags", kSecCodeSignerPreserveFlags,					true },
+		{ "team-identifier", kSecCodeSignerPreserveTeamIdentifier, true},
 		{ NULL }
 	};
+	uint32_t flags;
 	if (arg == NULL) {	// --preserve-metadata compatibility default
-		uint32_t flags = kSecCodeSignerPreserveRequirements | kSecCodeSignerPreserveEntitlements | kSecCodeSignerPreserveResourceRules | kSecCodeSignerPreserveFlags;
+		flags = kSecCodeSignerPreserveRequirements | kSecCodeSignerPreserveEntitlements | kSecCodeSignerPreserveResourceRules | kSecCodeSignerPreserveFlags;
 		if (!getenv("RC_XBS") || getenv("RC_BUILDIT"))	// if we're NOT in real B&I...
 			flags |= kSecCodeSignerPreserveIdentifier;				// ... then preserve identifier too
-		return flags;
+		note(0, "Warning: default usage of --preserve-metadata implies \"resource-rules\" (deprecated in Mac OS X >= 10.10)!");
 	} else {
-		return parseOptionTable(arg, metadataFlags);
+		flags = parseOptionTable(arg, metadataFlags);
+		if (flags & kSecCodeSignerPreserveResourceRules) {
+			note(0, "Warning: usage of --preserve-metadata with option \"resource-rules\" (deprecated in Mac OS X >= 10.10)!",
+				 options[optPreserveMetadata].name, options[optResourceRules]);
+		}
 	}
+
+	return flags;
 }
 
 
